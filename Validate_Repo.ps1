@@ -265,13 +265,13 @@ $InvokeRepoValidation = {
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $bbRefs = @()
-        } else { $bbRefs = $r.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object }
+        } else { $bbRefs = $r.Output | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ } | Sort-Object }
 
         $r = & $git ls-remote $ghUrl
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: github$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $ghRefs = @()
-        } else { $ghRefs = $r.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object }
+        } else { $ghRefs = $r.Output | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ } | Sort-Object }
 
         if ($bbRefs -and $ghRefs -and (Compare-Object $bbRefs $ghRefs)) {
             & $fail 'REF MISMATCH'
