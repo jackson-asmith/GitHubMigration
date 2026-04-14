@@ -118,9 +118,21 @@ validate_repo() {
        | grep -q 'filter=lfs'; then
 
     # WARN: LFS volume
+    # git lfs ls-files -s outputs human-readable sizes, e.g.:
+    #   abc123def * path/to/file (1.5 GB)
+    # $(NF-1) is the numeric part; $NF is the unit with a closing paren.
+    # Strip the paren from the unit, then convert to bytes before summing.
     local lfs_size
     lfs_size=$(git --git-dir=$repo.git lfs ls-files -s 2>/dev/null \
-      | awk '{sum += $NF} END {print sum+0}')
+      | awk '{
+          v = $(NF-1); sub(/^\(/, "", v); v = v + 0
+          u = $NF;     sub(/\)$/, "", u)
+          mult = (u == "TB") ? 1099511627776 : \
+                 (u == "GB") ? 1073741824    : \
+                 (u == "MB") ? 1048576       : \
+                 (u == "KB") ? 1024          : 1
+          sum += v * mult
+        } END { print int(sum + 0) }')
     (( lfs_size > WARN_LFS_SIZE_BYTES )) \
       && warn "LARGE LFS VOLUME (${lfs_size} bytes)" || true
 
