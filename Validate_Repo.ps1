@@ -78,39 +78,46 @@ function Test-Preflight {
     }
 
     # --- Per-repo local checks ------------------------------------------------
-    foreach ($repo in $Repos) {
-        if (-not (Test-Path "$repo.git" -PathType Container)) {
-            Write-Error "Local mirror not found: $repo.git"
-            $ok = $false
-            continue
-        }
-        git --git-dir="$repo.git" remote get-url $GitHubRemoteName 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Remote '$GitHubRemoteName' not configured in $repo.git"
-            $ok = $false
+    # Gated on $gitFound — without git these calls would throw command-not-found
+    # errors that look like real failures rather than a missing-tool error.
+    if ($gitFound) {
+        foreach ($repo in $Repos) {
+            if (-not (Test-Path "$repo.git" -PathType Container)) {
+                Write-Error "Local mirror not found: $repo.git"
+                $ok = $false
+                continue
+            }
+            git --git-dir="$repo.git" remote get-url $GitHubRemoteName 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "Remote '$GitHubRemoteName' not configured in $repo.git"
+                $ok = $false
+            }
         }
     }
 
     # --- GitHub auth ----------------------------------------------------------
     # --hostname targets the configured host explicitly; without it gh defaults
     # to github.com regardless of $GitHubHost.
-    gh auth status --hostname $GitHubHost 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "gh is not authenticated for $GitHubHost — run 'gh auth login --hostname $GitHubHost'"
-        $ok = $false
-    } else {
-        # Cheap API call confirms the token is valid and the host is reachable.
-        gh api --hostname $GitHubHost '/user' 2>&1 | Out-Null
+    # Gated on $ghFound for the same reason as the git block above.
+    if ($ghFound) {
+        gh auth status --hostname $GitHubHost 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "gh API call failed for $GitHubHost — check token scope and network connectivity"
+            Write-Error "gh is not authenticated for $GitHubHost — run 'gh auth login --hostname $GitHubHost'"
             $ok = $false
+        } else {
+            # Cheap API call confirms the token is valid and the host is reachable.
+            gh api --hostname $GitHubHost '/user' 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "gh API call failed for $GitHubHost — check token scope and network connectivity"
+                $ok = $false
+            }
         }
     }
 
     # --- Bitbucket connectivity -----------------------------------------------
     # Smoke test against the first repo to catch SSH key or host reachability
     # issues before spawning parallel workers.
-    if ($Repos.Count -gt 0) {
+    if ($gitFound -and $Repos.Count -gt 0) {
         $bbTestUrl = "$BitbucketBase/$($Repos[0])"
         Write-Verbose "Bitbucket connectivity test: $bbTestUrl"
         git ls-remote $bbTestUrl HEAD 2>&1 | Out-Null
@@ -122,7 +129,7 @@ function Test-Preflight {
 
     # --- Optional GitHub SSH smoke test ---------------------------------------
     # Runs against the first repo; if SSH works for one it works for all.
-    if (-not $SkipSshTest -and $Repos.Count -gt 0) {
+    if ($gitFound -and -not $SkipSshTest -and $Repos.Count -gt 0) {
         $testUrl = "git@${GitHubHost}:$GitHubOrg/$($Repos[0]).git"
         Write-Verbose "GitHub SSH smoke test: $testUrl"
         git ls-remote $testUrl HEAD 2>&1 | Out-Null
@@ -162,9 +169,13 @@ if (-not (Test-Preflight @preflightParams)) {
 }
 
 # Initialise CSV header. Kept outside $InvokeRepoValidation so parallel
-# workers cannot race on header creation.
+# workers cannot race on header creation. A prototype object drives the
+# header so the column names stay in sync with the row-writing code below.
 if (-not (Test-Path $CsvOut)) {
-    'repo,status,errors,warnings,notes' | Set-Content $CsvOut -Encoding UTF8
+    [PSCustomObject]@{ repo = ''; status = ''; errors = 0; warnings = 0; notes = '' } |
+        ConvertTo-Csv -UseQuotes AsNeeded |
+        Select-Object -First 1 |
+        Set-Content $CsvOut -Encoding UTF8
 }
 
 # ==========================================================================
@@ -219,6 +230,9 @@ $InvokeRepoValidation = {
     # blocked waiting for the other stream's buffer to drain, we hang.
     # ProcessStartInfo.ArgumentList (available in .NET 5+ / PS7) handles
     # argument quoting correctly without manual escaping.
+    #
+    # NOTE: WorkingDirectory is not configurable here. Use -C for git or
+    # equivalent flags to set the working directory per-call.
     $invokeNative = {
         param([string]$Exe, [string[]]$Arguments)
         $psi = [System.Diagnostics.ProcessStartInfo]@{
@@ -231,10 +245,21 @@ $InvokeRepoValidation = {
         $p       = [System.Diagnostics.Process]::Start($psi)
         $outTask = $p.StandardOutput.ReadToEndAsync()
         $errTask = $p.StandardError.ReadToEndAsync()
+        # WaitForExit() with no timeout argument waits for both the process and
+        # any redirected streams to fully drain before returning. We then call
+        # .GetAwaiter().GetResult() rather than .Result so that task exceptions
+        # are unwrapped from AggregateException and surface cleanly.
         $p.WaitForExit()
+        $rawOut = $outTask.GetAwaiter().GetResult()
+        $rawErr = $errTask.GetAwaiter().GetResult()
         [PSCustomObject]@{
-            Output   = @($outTask.Result -split '\r?\n' | Where-Object { $_ })
-            Stderr   = $errTask.Result.Trim()
+            # Normalise whitespace centrally so all callers receive consistent
+            # lines regardless of platform line endings or tab-vs-space
+            # variance (e.g. the SHA<TAB>ref layout in git ls-remote output).
+            Output   = @($rawOut -split '\r?\n' |
+                         ForEach-Object { ($_ -replace '\s+', ' ').Trim() } |
+                         Where-Object   { $_ })
+            Stderr   = $rawErr.Trim()
             ExitCode = $p.ExitCode
         }
     }
@@ -267,13 +292,13 @@ $InvokeRepoValidation = {
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $bbRefs = @()
-        } else { $bbRefs = $r.Output | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ } | Sort-Object }
+        } else { $bbRefs = $r.Output | Sort-Object }
 
         $r = & $git ls-remote $ghUrl
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: github$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $ghRefs = @()
-        } else { $ghRefs = $r.Output | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ } | Sort-Object }
+        } else { $ghRefs = $r.Output | Sort-Object }
 
         if ($bbRefs -and $ghRefs -and (Compare-Object $bbRefs $ghRefs)) {
             & $fail 'REF MISMATCH'
@@ -359,15 +384,79 @@ $InvokeRepoValidation = {
             }
         }
 
-        # --- LFS -----------------------------------------------------------
-        $r = & $git --git-dir "$Repo.git" show HEAD:.gitattributes
-        if ($r.ExitCode -eq 0 -and ($r.Output -join "`n") -match 'filter=lfs') {
+        # --- LFS detection (tiered) ----------------------------------------
+        #
+        # Tier A — pointer presence (definitive).
+        # git lfs ls-files --all scans every ref tip in the mirror for LFS
+        # pointer objects. Any output means LFS content definitely exists and
+        # requires full validation. This is more reliable than inspecting
+        # .gitattributes because:
+        #   - .gitattributes may not exist on HEAD (only on other branches)
+        #   - LFS pointers can outlive .gitattributes if tracking was removed
+        #     without scrubbing historical objects
+        #   - Global LFS rules (~/.gitattributes_global) aren't in the repo
+        $r = & $git --git-dir "$Repo.git" lfs ls-files --all
+        $hasLfsObjects = $r.ExitCode -eq 0 -and $r.Output.Count -gt 0
+
+        # Ref list is shared by Tier B and Tier C — compute once so
+        # for-each-ref is not called redundantly.
+        $allBranchTagRefs = @()
+        if (-not $hasLfsObjects) {
+            $r = & $git --git-dir "$Repo.git" for-each-ref '--format=%(refname)' 'refs/heads' 'refs/tags'
+            if ($r.ExitCode -eq 0) { $allBranchTagRefs = $r.Output }
+        }
+
+        # Tier B — config-only scan (catches "configured but empty" repos).
+        # Only reached when Tier A finds nothing. Scans .gitattributes at
+        # every branch and tag tip; skips refs/remotes since those duplicate
+        # refs/heads content after a mirror fetch.
+        # Result drives a WARN only — with no objects there is nothing to
+        # validate against GitHub.
+        $hasLfsConfig = $false
+        if (-not $hasLfsObjects -and $allBranchTagRefs.Count -gt 0) {
+            foreach ($refName in $allBranchTagRefs) {
+                $ra = & $git --git-dir "$Repo.git" show "${refName}:.gitattributes"
+                if ($ra.ExitCode -eq 0 -and ($ra.Output -join "`n") -match 'filter=lfs') {
+                    $hasLfsConfig = $true
+                    break
+                }
+            }
+        }
+
+        # Tier C — pointer signature scan (ref tips only, not full history).
+        # Reached only when Tiers A and B both find no LFS evidence. Searches
+        # blob content at every branch/tag tip for the git-lfs pointer header
+        # string. Catches repos where pointer objects exist but git-lfs does
+        # not recognise them — e.g. the mirror was fetched without LFS support,
+        # .gitattributes was removed after pointers were committed, or there
+        # is a git-lfs version mismatch.
+        #
+        # git grep deduplicates blobs across refs internally, so a blob
+        # present on 50 branches is scanned once. -q exits on the first match
+        # rather than enumerating all occurrences, bounding the cost further.
+        #
+        # Intentionally NOT run against full history. For a manual full-history
+        # sweep of a specific repo (e.g. investigating a mysterious failure):
+        #   git --git-dir=repo.git rev-list --objects --all |
+        #     git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname)' |
+        #     awk '$1=="blob" && $2<200 {print $3}' |
+        #     git --git-dir=repo.git cat-file --batch |
+        #     grep 'version https://git-lfs.github.com/objects/'
+        $hasLfsPointers = $false
+        if (-not $hasLfsObjects -and -not $hasLfsConfig -and $allBranchTagRefs.Count -gt 0) {
+            $grepArgs = @('--git-dir', "$Repo.git", 'grep', '-q', '--fixed-strings',
+                          'version https://git-lfs.github.com/objects/') + $allBranchTagRefs
+            $rg = & $git @grepArgs
+            $hasLfsPointers = $rg.ExitCode -eq 0
+        }
+
+        if ($hasLfsObjects) {
 
             # WARN: LFS volume.
-            # git lfs ls-files -s outputs human-readable sizes, e.g.:
-            #   abc123def * path/to/file (1.5 GB)
-            # The last two tokens inside the parens are <number> <unit>, so
-            # we parse both and convert to bytes for an accurate sum.
+            # Sized against HEAD only to avoid double-counting objects that
+            # appear across multiple branches. git lfs ls-files -s outputs
+            # human-readable sizes, e.g.:  abc123def * path/to/file (1.5 GB)
+            # The last two tokens inside the parens are <number> <unit>.
             # NOTE: the original bash script used awk '{sum += $NF}' which
             # always produced 0 because $NF captures the unit suffix
             # ("GB)", "MB)", etc.) — meaning the warning never fired.
@@ -396,24 +485,73 @@ $InvokeRepoValidation = {
             # lfs fsck (no --pointers) forces pointer->object resolution
             # against the remote. --git-dir is insufficient for LFS object
             # resolution so a real clone is required.
-            $lfsTmp = New-Item @{
-                ItemType = 'Directory'
-                Path     = [System.IO.Path]::GetTempPath()
-                Name     = [System.IO.Path]::GetRandomFileName()
-                Force    = $true
-            }
+            #
+            # Fixed parent dir groups all LFS temp clones under one path.
+            # If the process is killed before 'finally' runs, leftovers are
+            # easy to find and sweep with:
+            #   Remove-Item -Recurse -Force "$env:TEMP/validate-repo-lfs"
+            # -Force on New-Item is safe under parallel workers: creates the
+            # directory if absent, silently succeeds if it already exists.
+            $lfsWorkDir = [System.IO.Path]::Combine(
+                [System.IO.Path]::GetTempPath(), 'validate-repo-lfs')
+            New-Item -ItemType Directory -Path $lfsWorkDir -Force | Out-Null
+            $lfsTmpPath = [System.IO.Path]::Combine(
+                $lfsWorkDir, [System.IO.Path]::GetRandomFileName())
+            New-Item -ItemType Directory -Path $lfsTmpPath -Force | Out-Null
             try {
-                $r = & $git clone --no-checkout $ghUrl $lfsTmp.FullName
+                # --filter=blob:none: blobless clone — transfers commits and
+                # trees only; regular blobs are omitted because we only need
+                # to verify LFS objects, which git lfs fetch --all handles
+                # separately. Dramatically reduces data transfer for large
+                # repos regardless of non-LFS content volume.
+                #
+                # -c flags reduce noise and improve CI stability:
+                #   advice.detachedHead=false — suppresses the detached HEAD warning
+                #   gc.auto=0                 — disables automatic GC during clone
+                #   core.longpaths=true       — safe handling of deep paths on Windows
+                $cloneArgs = @(
+                    '-c', 'advice.detachedHead=false',
+                    '-c', 'gc.auto=0',
+                    '-c', 'core.longpaths=true',
+                    'clone', '--no-checkout', '--filter=blob:none',
+                    $ghUrl, $lfsTmpPath
+                )
+                $r = & $git @cloneArgs
                 if ($r.ExitCode -eq 0) {
-                    $r = & $git -C $lfsTmp.FullName lfs fetch --all
+                    # --all fetches every LFS object reachable from every ref.
+                    # This is intentionally the heaviest fetch scope: migration
+                    # validation must confirm GitHub holds all objects across
+                    # all branches and tags, not just the default branch.
+                    # To verify only the default branch (lighter, less complete):
+                    #   git lfs fetch origin <default-branch>
+                    $r = & $git -C $lfsTmpPath lfs fetch --all
                     if ($r.ExitCode -eq 0) {
-                        $r = & $git -C $lfsTmp.FullName lfs fsck
+                        $r = & $git -C $lfsTmpPath lfs fsck
                     }
                 }
                 if ($r.ExitCode -ne 0) { & $fail 'LFS OBJECT MISSING ON GITHUB' }
             } finally {
-                Remove-Item -Recurse -Force $lfsTmp.FullName -ErrorAction SilentlyContinue
+                Remove-Item -Recurse -Force $lfsTmpPath -ErrorAction SilentlyContinue
             }
+
+        } elseif ($hasLfsConfig) {
+            # LFS rules exist in .gitattributes on at least one branch or tag
+            # but no pointer objects were found in the mirror. This is unusual
+            # — either no files have been tracked yet or all objects were
+            # removed from history. Nothing to validate, but worth surfacing.
+            & $warn 'LFS CONFIGURED (filter=lfs in .gitattributes) BUT NO LFS OBJECTS FOUND — verify intentional'
+
+        } elseif ($hasLfsPointers) {
+            # Pointer signatures found in blob content at ref tips, but
+            # git lfs ls-files --all returned nothing (Tier A) and no
+            # filter=lfs rule exists in .gitattributes on any branch or tag
+            # (Tier B). Likely causes:
+            #   - Mirror was cloned/fetched without git-lfs installed
+            #   - .gitattributes was deleted after pointer objects were committed
+            #   - git-lfs version mismatch preventing pointer recognition
+            # Standard LFS validation cannot proceed reliably; manual audit
+            # required. See the Tier C comment above for the full history sweep.
+            & $warn 'UNTRACKED LFS POINTER SIGNATURES FOUND IN BLOB CONTENT — git-lfs does not recognise these objects; manual LFS audit required'
         }
 
     } while ($false)
@@ -431,13 +569,28 @@ $InvokeRepoValidation = {
     # corrupt rows. The main process merges temp files after
     # ForEach-Object -Parallel completes.
     #
-    # Forward slashes in the repo slug are replaced so the name is
-    # filesystem-safe. Embedded double quotes are stripped from notes to
-    # prevent CSV parser breakage. Notes are machine-generated so this
-    # should be a no-op.
-    $notesJoined = ($state.Notes -join ';') -replace '"', ''
-    $safeRepo    = $Repo -replace '/', '_'
-    "$Repo,$status,$($state.Errors),$($state.Warnings),`"$notesJoined`"" |
+    # ConvertTo-Csv handles all quoting correctly per RFC 4180: fields that
+    # contain commas, double-quotes, or newlines are wrapped in double-quotes,
+    # and any embedded double-quotes are escaped by doubling them. This
+    # replaces the previous manual string construction which stripped quotes
+    # rather than escaping them, silently destroying data.
+    #
+    # -UseQuotes AsNeeded (PS 7+) quotes only fields that require it, keeping
+    # the output readable while remaining fully spec-compliant.
+    # Select-Object -Skip 1 drops the header row — the header was written
+    # once to CsvOut before workers were spawned.
+    #
+    # Forward slashes in the repo slug are replaced so the temp file name is
+    # filesystem-safe; this does not affect the repo field written to the CSV.
+    $safeRepo = $Repo -replace '[/\\]', '_'
+    [PSCustomObject]@{
+        repo     = $Repo
+        status   = $status
+        errors   = $state.Errors
+        warnings = $state.Warnings
+        notes    = $state.Notes -join ';'
+    } | ConvertTo-Csv -UseQuotes AsNeeded |
+        Select-Object -Skip 1 |
         Set-Content "${CsvOut}.${safeRepo}.tmp" -Encoding UTF8
 
     # WARNs are non-blocking; only FAILs produce a non-zero exit signal.
