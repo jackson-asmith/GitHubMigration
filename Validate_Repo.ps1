@@ -162,7 +162,9 @@ $InvokeRepoValidation = {
 
         # --- WARN: branch count --------------------------------------------
         $branchCount = (
-            git --git-dir="$Repo.git" branch -r | Measure-Object -Line
+            git --git-dir="$Repo.git" branch -r |
+                Where-Object { $_ -notmatch '->' } |
+                Measure-Object -Line
         ).Lines
 
         if ($LASTEXITCODE -eq 0 -and $branchCount -gt $WarnBranchCount) {
@@ -265,7 +267,7 @@ $InvokeRepoValidation = {
 
 Write-Verbose "Starting validation (parallelism=$Parallelism) ..."
 
-$repos = Get-Content $ReposFile | Where-Object { $_.Trim() -ne '' }
+$repos = Get-Content $ReposFile | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 # ForEach-Object -Parallel spawns up to ThrottleLimit runspaces concurrently.
 # $using: is required to pass outer-scope values into each runspace.
