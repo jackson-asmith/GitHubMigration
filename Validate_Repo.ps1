@@ -561,7 +561,8 @@ $InvokeRepoValidation = {
             #   - git-lfs version mismatch preventing pointer recognition
             # Standard LFS validation cannot proceed reliably; manual audit
             # required. See the Tier C comment above for the full history sweep.
-            & $warn 'UNTRACKED LFS POINTER SIGNATURES FOUND IN BLOB CONTENT — git-lfs does not recognise these objects; manual LFS audit required'
+            & $warn ('UNTRACKED LFS POINTER SIGNATURES FOUND IN BLOB CONTENT — ' +
+                     'git-lfs does not recognise these objects; manual LFS audit required')
         }
 
     } while ($false)
