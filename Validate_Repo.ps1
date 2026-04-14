@@ -52,17 +52,20 @@ function Test-Preflight {
     $ok = $true
 
     # --- Required tools -------------------------------------------------------
-    foreach ($tool in @('git', 'gh')) {
-        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            Write-Error "$tool not found in PATH"
+    $gitFound = [bool](Get-Command 'git' -ErrorAction SilentlyContinue)
+    $ghFound  = [bool](Get-Command 'gh'  -ErrorAction SilentlyContinue)
+
+    if (-not $gitFound) { Write-Error 'git not found in PATH'; $ok = $false }
+    if (-not $ghFound)  { Write-Error 'gh not found in PATH';  $ok = $false }
+
+    # Gate the lfs check on git being present; without git the command would
+    # throw a terminating command-not-found error and skip all further checks.
+    if ($gitFound) {
+        git lfs version 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error 'git-lfs not available — install it or ensure it is on PATH'
             $ok = $false
         }
-    }
-
-    git lfs version 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error 'git-lfs not available — install it or ensure it is on PATH'
-        $ok = $false
     }
 
     # --- Repos list -----------------------------------------------------------
@@ -136,6 +139,12 @@ function Test-Preflight {
 # Serial setup — must complete before workers are spawned
 # ==========================================================================
 
+# Write-Information (stream 6) is buffered per-runspace in
+# ForEach-Object -Parallel, so per-repo output appears as a clean block
+# rather than interleaved across workers. PS7 parallel runspaces inherit
+# preference variables from the calling scope, so this setting propagates.
+$InformationPreference = 'Continue'
+
 $repos = Get-Content $ReposFile | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 Write-Verbose 'Running preflight checks ...'
@@ -192,56 +201,49 @@ $InvokeRepoValidation = {
     # inside each helper are reflected in the calling scope.
     $fail = {
         param([string]$Msg)
-        Write-Host "  FAIL [$Repo]: $Msg"
+        Write-Information "  FAIL [$Repo]: $Msg"
         $state.Notes.Add("FAIL: $Msg")
         $state.Errors++
     }.GetNewClosure()
 
     $warn = {
         param([string]$Msg)
-        Write-Host "  WARN [$Repo]: $Msg"
+        Write-Information "  WARN [$Repo]: $Msg"
         $state.Notes.Add("WARN: $Msg")
         $state.Warnings++
     }.GetNewClosure()
 
-    # Thin wrappers that reliably capture stdout, stderr, and exit code.
-    # 2>&1 in PowerShell produces plain strings for native command stderr,
-    # not [ErrorRecord] objects — so we redirect stderr to a temp file
-    # to separate the streams correctly across all PS7 versions.
-    # $args is splatted directly to the native command — no param() needed.
-    $git = {
-        $errTmp = [IO.Path]::GetTempFileName()
-        try {
-            $stdout = git @args 2>$errTmp
-            $exit   = $LASTEXITCODE
-            $stderr = (Get-Content $errTmp -Raw -ErrorAction SilentlyContinue)?.Trim()
-        } finally {
-            Remove-Item $errTmp -ErrorAction SilentlyContinue
+    # Shared process helper — captures stdout and stderr into separate strings
+    # via async reads on both streams. The async pattern is required to prevent
+    # deadlocks: if we read one stream synchronously while the process is
+    # blocked waiting for the other stream's buffer to drain, we hang.
+    # ProcessStartInfo.ArgumentList (available in .NET 5+ / PS7) handles
+    # argument quoting correctly without manual escaping.
+    $invokeNative = {
+        param([string]$Exe, [string[]]$Arguments)
+        $psi = [System.Diagnostics.ProcessStartInfo]@{
+            FileName               = $Exe
+            RedirectStandardOutput = $true
+            RedirectStandardError  = $true
+            UseShellExecute        = $false
         }
+        foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+        $p       = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
         [PSCustomObject]@{
-            Output   = @($stdout | Where-Object { $_ -ne $null })
-            Stderr   = $stderr ?? ''
-            ExitCode = $exit
+            Output   = @($outTask.Result -split '\r?\n' | Where-Object { $_ })
+            Stderr   = $errTask.Result.Trim()
+            ExitCode = $p.ExitCode
         }
     }
 
-    # $gh injects --hostname automatically via GetNewClosure() so every call
-    # targets the configured host rather than gh's default of github.com.
-    $gh = {
-        $errTmp = [IO.Path]::GetTempFileName()
-        try {
-            $stdout = gh --hostname $GitHubHost @args 2>$errTmp
-            $exit   = $LASTEXITCODE
-            $stderr = (Get-Content $errTmp -Raw -ErrorAction SilentlyContinue)?.Trim()
-        } finally {
-            Remove-Item $errTmp -ErrorAction SilentlyContinue
-        }
-        [PSCustomObject]@{
-            Output   = @($stdout | Where-Object { $_ -ne $null })
-            Stderr   = $stderr ?? ''
-            ExitCode = $exit
-        }
-    }.GetNewClosure()
+    # $git and $gh are thin closures over $invokeNative. $gh also captures
+    # $GitHubHost to inject --hostname on every call, ensuring we always
+    # target the configured host rather than gh's default of github.com.
+    $git = { & $invokeNative 'git' $args }.GetNewClosure()
+    $gh  = { & $invokeNative 'gh' (@('--hostname', $GitHubHost) + $args) }.GetNewClosure()
 
     # Convenience URL locals — avoids repeating construction throughout.
     $bbUrl = "$BitbucketBase/$Repo"
@@ -421,7 +423,7 @@ $InvokeRepoValidation = {
               elseif ($state.Warnings -gt 0) { 'WARN' }
               else { 'OK' }
 
-    Write-Host "${status}: $Repo (errors=$($state.Errors) warnings=$($state.Warnings))"
+    Write-Information "${status}: $Repo (errors=$($state.Errors) warnings=$($state.Warnings))"
 
     # --- CSV output --------------------------------------------------------
     # Each worker writes to a per-repo temp file rather than appending
