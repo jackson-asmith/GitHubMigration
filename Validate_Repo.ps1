@@ -8,17 +8,25 @@
 [CmdletBinding()]
 param(
     # Output CSV path. Env var CSV_OUT is honoured for CI compatibility.
-    [string]$CsvOut     = ($env:CSV_OUT     ?? 'migration_validation.csv'),
+    [string]$CsvOut           = ($env:CSV_OUT            ?? 'migration_validation.csv'),
 
     # Concurrency cap. LFS repos each perform a full clone + lfs fetch --all
     # against GitHub. At Parallelism=4, assume up to 4 simultaneous clones.
     # Reduce if GitHub rate limits or network saturation is observed.
     [ValidateRange(1, 64)]
-    [int]$Parallelism   = ($env:PARALLELISM  ?? 4),
+    [int]$Parallelism         = ($env:PARALLELISM         ?? 4),
 
     # Repo list — one repo slug per line.
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
-    [string]$ReposFile  = ($env:REPOS_FILE  ?? 'repos.txt')
+    [string]$ReposFile        = ($env:REPOS_FILE         ?? 'repos.txt'),
+
+    [string]$GitHubOrg        = ($env:GITHUB_ORG         ?? 'org'),
+    [string]$GitHubHost       = ($env:GITHUB_HOST        ?? 'github.com'),
+    [string]$GitHubRemoteName = ($env:GITHUB_REMOTE_NAME ?? 'github'),
+    [string]$BitbucketBase    = ($env:BITBUCKET_BASE     ?? 'ssh://bitbucket'),
+
+    # Pass -SkipSshTest to omit the SSH connectivity smoke test in preflight.
+    [switch]$SkipSshTest
 )
 
 # Warn thresholds
@@ -27,8 +35,102 @@ param(
 [long]$WarnLfsSizeBytes = 1073741824    # 1 GiB
 
 # ==========================================================================
+# Preflight
+# ==========================================================================
+
+function Test-Preflight {
+    [CmdletBinding()]
+    param(
+        [string[]]$Repos,
+        [string]$GitHubOrg,
+        [string]$GitHubHost,
+        [string]$GitHubRemoteName,
+        [switch]$SkipSshTest
+    )
+
+    $ok = $true
+
+    # --- Required tools -------------------------------------------------------
+    foreach ($tool in @('git', 'gh')) {
+        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+            Write-Error "$tool not found in PATH"
+            $ok = $false
+        }
+    }
+
+    git lfs version 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error 'git-lfs not available — install it or ensure it is on PATH'
+        $ok = $false
+    }
+
+    # --- Repos list -----------------------------------------------------------
+    if ($Repos.Count -eq 0) {
+        Write-Error 'Repos file is empty — nothing to validate'
+        $ok = $false
+    }
+
+    # --- Per-repo local checks ------------------------------------------------
+    foreach ($repo in $Repos) {
+        if (-not (Test-Path "$repo.git" -PathType Container)) {
+            Write-Error "Local mirror not found: $repo.git"
+            $ok = $false
+            continue
+        }
+        git --git-dir="$repo.git" remote get-url $GitHubRemoteName 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Remote '$GitHubRemoteName' not configured in $repo.git"
+            $ok = $false
+        }
+    }
+
+    # --- GitHub auth ----------------------------------------------------------
+    gh auth status 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "gh is not authenticated — run 'gh auth login' first"
+        $ok = $false
+    } else {
+        # Cheap API call confirms the token is valid and the host is reachable.
+        gh api '/user' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "gh API call failed — check token scope and connectivity to $GitHubHost"
+            $ok = $false
+        }
+    }
+
+    # --- Optional SSH smoke test ----------------------------------------------
+    # Runs against the first repo; if SSH works for one it works for all.
+    if (-not $SkipSshTest -and $Repos.Count -gt 0) {
+        $testUrl = "git@${GitHubHost}:$GitHubOrg/$($Repos[0]).git"
+        Write-Verbose "SSH smoke test: $testUrl"
+        git ls-remote $testUrl HEAD 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "SSH smoke test failed for $testUrl — check SSH key and repo access"
+            $ok = $false
+        }
+    }
+
+    return $ok
+}
+
+# ==========================================================================
 # Serial setup — must complete before workers are spawned
 # ==========================================================================
+
+$repos = Get-Content $ReposFile | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+Write-Verbose 'Running preflight checks ...'
+$preflightParams = @{
+    Repos            = $repos
+    GitHubOrg        = $GitHubOrg
+    GitHubHost       = $GitHubHost
+    GitHubRemoteName = $GitHubRemoteName
+    SkipSshTest      = $SkipSshTest
+}
+if (-not (Test-Preflight @preflightParams)) {
+    Write-Error 'Preflight failed — resolve the above errors before running validation.'
+    exit 1
+}
 
 # Initialise CSV header. Kept outside $InvokeRepoValidation so parallel
 # workers cannot race on header creation.
@@ -48,6 +150,10 @@ $InvokeRepoValidation = {
     param(
         [string]$Repo,
         [string]$CsvOut,
+        [string]$GitHubOrg,
+        [string]$GitHubHost,
+        [string]$GitHubRemoteName,
+        [string]$BitbucketBase,
         [long]$WarnRepoSizeKiB,
         [int]$WarnBranchCount,
         [long]$WarnLfsSizeBytes
@@ -64,7 +170,6 @@ $InvokeRepoValidation = {
     # --- Helpers -----------------------------------------------------------
     # .GetNewClosure() captures $state and $Repo by reference so mutations
     # inside each helper are reflected in the calling scope.
-
     $fail = {
         param([string]$Msg)
         Write-Host "  FAIL [$Repo]: $Msg"
@@ -79,6 +184,33 @@ $InvokeRepoValidation = {
         $state.Warnings++
     }.GetNewClosure()
 
+    # Thin wrappers that capture stdout, stderr, and exit code together so
+    # FAIL messages can include the actual command error text. $args is
+    # splatted directly to the native command — no param() block needed.
+    $git = {
+        $raw = git @args 2>&1
+        [PSCustomObject]@{
+            Output   = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+            Stderr   = ($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                        ForEach-Object { $_.Exception.Message }) -join ' '
+            ExitCode = $LASTEXITCODE
+        }
+    }
+
+    $gh = {
+        $raw = gh @args 2>&1
+        [PSCustomObject]@{
+            Output   = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+            Stderr   = ($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                        ForEach-Object { $_.Exception.Message }) -join ' '
+            ExitCode = $LASTEXITCODE
+        }
+    }
+
+    # Convenience URL locals — avoids repeating construction throughout.
+    $bbUrl = "$BitbucketBase/$Repo"
+    $ghUrl = "git@${GitHubHost}:$GitHubOrg/$Repo.git"
+
     # do/while($false) lets any check call `break` to skip remaining checks
     # while still falling through to the CSV write below. This ensures every
     # repo always gets a row in the output, even on early failures.
@@ -87,16 +219,23 @@ $InvokeRepoValidation = {
         # --- Sync mirror ---------------------------------------------------
         # Fetch and prune before validating so stale, deleted, and renamed
         # refs are reflected in the local mirror prior to any diff.
-        git --git-dir="$Repo.git" fetch --prune github
-        if ($LASTEXITCODE -ne 0) { & $fail 'FETCH FAILED'; break }
+        $r = & $git --git-dir "$Repo.git" fetch --prune $GitHubRemoteName
+        if ($r.ExitCode -ne 0) { & $fail "FETCH FAILED$(if ($r.Stderr) { ': ' + $r.Stderr })"; break }
 
         # --- Ref integrity -------------------------------------------------
         # Diff every ref/SHA pair between Bitbucket and GitHub. A clean diff
         # guarantees identical commit graphs.
-        $bbRefs = git ls-remote "ssh://bitbucket/$Repo" | Sort-Object
-        if ($LASTEXITCODE -ne 0) { & $fail 'LS-REMOTE FAILED: bitbucket'; $bbRefs = @() }
-        $ghRefs = git ls-remote "git@github.com:org/$Repo.git" | Sort-Object
-        if ($LASTEXITCODE -ne 0) { & $fail 'LS-REMOTE FAILED: github'; $ghRefs = @() }
+        $r = & $git ls-remote $bbUrl
+        if ($r.ExitCode -ne 0) {
+            & $fail "LS-REMOTE FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            $bbRefs = @()
+        } else { $bbRefs = $r.Output | Sort-Object }
+
+        $r = & $git ls-remote $ghUrl
+        if ($r.ExitCode -ne 0) {
+            & $fail "LS-REMOTE FAILED: github$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            $ghRefs = @()
+        } else { $ghRefs = $r.Output | Sort-Object }
 
         if ($bbRefs -and $ghRefs -and (Compare-Object $bbRefs $ghRefs)) {
             & $fail 'REF MISMATCH'
@@ -110,40 +249,49 @@ $InvokeRepoValidation = {
                 $parts = $_ -split '\s+', 2
                 $sha   = $parts[0]
                 $ref   = if ($parts.Count -gt 1) { $parts[1] } else { '' }
-                git --git-dir="$Repo.git" cat-file -e $sha 2>$null
-                if ($LASTEXITCODE -ne 0) {
-                    & $fail "MISSING OBJECT: $sha $ref"
-                }
+                $r = & $git --git-dir "$Repo.git" cat-file -e $sha
+                if ($r.ExitCode -ne 0) { & $fail "MISSING OBJECT: $sha $ref" }
             }
         }
 
         # --- Default branch ------------------------------------------------
-        # Use --symref to extract Bitbucket's HEAD symref reliably.
-        $bbDefault = git ls-remote --symref "ssh://bitbucket/$Repo" HEAD |
-            Where-Object { $_ -match '^ref:' } |
-            ForEach-Object { ($_ -split '\s+')[1] } |
-            Select-Object -First 1
-        if ($LASTEXITCODE -ne 0) { & $fail 'LS-REMOTE --SYMREF FAILED: bitbucket'; $bbDefault = $null }
+        # --symref returns both the symref line (for branch name) and the SHA
+        # line (for HEAD comparison) in a single call, saving a round trip vs.
+        # a separate ls-remote for bbHead.
+        $r = & $git ls-remote --symref $bbUrl HEAD
+        if ($r.ExitCode -ne 0) {
+            & $fail "LS-REMOTE --SYMREF FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            $bbDefault = $null
+            $bbHead    = $null
+        } else {
+            $bbDefault = $r.Output |
+                Where-Object { $_ -match '^ref:' } |
+                ForEach-Object { ($_ -split '\s+')[1] } |
+                Select-Object -First 1
+            # Reuse the --symref output for HEAD SHA — no separate ls-remote needed.
+            $bbHead = $r.Output |
+                Where-Object { $_ -match '\sHEAD$' -and $_ -notmatch '^ref:' } |
+                ForEach-Object { ($_ -split '\s+')[0] } |
+                Select-Object -First 1
+        }
 
-        $ghDefault = gh api "/repos/org/$Repo" --jq '.default_branch'
-        if ($LASTEXITCODE -ne 0) { & $fail 'GH API FAILED: default_branch'; $ghDefault = $null }
+        $r = & $gh api "/repos/$GitHubOrg/$Repo" --jq '.default_branch'
+        if ($r.ExitCode -ne 0) {
+            & $fail "GH API FAILED: default_branch$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            $ghDefault = $null
+        } else { $ghDefault = $r.Output | Select-Object -First 1 }
 
         # Name and SHA are checked independently for specific error messages.
         if ($bbDefault -and $ghDefault -and $bbDefault -ne "refs/heads/$ghDefault") {
             & $fail "DEFAULT BRANCH NAME MISMATCH: bb=$bbDefault gh=$ghDefault"
         }
 
-        $bbHead = git ls-remote "ssh://bitbucket/$Repo" HEAD |
+        # GitHub HEAD SHA extracted from the already-fetched $ghRefs —
+        # no additional ls-remote call needed.
+        $ghHead = $ghRefs |
             Where-Object { $_ -match '\sHEAD$' } |
             ForEach-Object { ($_ -split '\s+')[0] } |
             Select-Object -First 1
-        if ($LASTEXITCODE -ne 0) { & $fail 'LS-REMOTE HEAD FAILED: bitbucket'; $bbHead = $null }
-
-        $ghHead = git ls-remote "git@github.com:org/$Repo.git" HEAD |
-            Where-Object { $_ -match '\sHEAD$' } |
-            ForEach-Object { ($_ -split '\s+')[0] } |
-            Select-Object -First 1
-        if ($LASTEXITCODE -ne 0) { & $fail 'LS-REMOTE HEAD FAILED: github'; $ghHead = $null }
 
         if ($bbHead -and $ghHead -and $bbHead -ne $ghHead) {
             & $fail "HEAD SHA MISMATCH: bb=$bbHead gh=$ghHead"
@@ -151,42 +299,44 @@ $InvokeRepoValidation = {
 
         # --- WARN: repo size -----------------------------------------------
         # count-objects -v emits raw KiB; keep values arithmetic-safe.
-        $repoSizeKiB = git --git-dir="$Repo.git" count-objects -v |
-            Where-Object { $_ -match '^size-pack:\s+(\d+)' } |
-            ForEach-Object { [long]$Matches[1] } |
-            Select-Object -First 1
-
-        if ($LASTEXITCODE -eq 0 -and $repoSizeKiB -gt $WarnRepoSizeKiB) {
-            & $warn "REPO SIZE NEAR 2 GiB LIMIT (${repoSizeKiB} KiB)"
+        $r = & $git --git-dir "$Repo.git" count-objects -v
+        if ($r.ExitCode -eq 0) {
+            $repoSizeKiB = $r.Output |
+                Where-Object { $_ -match '^size-pack:\s+(\d+)' } |
+                ForEach-Object { [long]$Matches[1] } |
+                Select-Object -First 1
+            if ($repoSizeKiB -gt $WarnRepoSizeKiB) {
+                & $warn "REPO SIZE NEAR 2 GiB LIMIT (${repoSizeKiB} KiB)"
+            }
         }
 
         # --- WARN: branch count --------------------------------------------
-        $branchCount = (
-            git --git-dir="$Repo.git" branch -r |
+        $r = & $git --git-dir "$Repo.git" branch -r
+        if ($r.ExitCode -eq 0) {
+            $branchCount = ($r.Output |
                 Where-Object { $_ -notmatch '->' } |
-                Measure-Object -Line
-        ).Lines
-
-        if ($LASTEXITCODE -eq 0 -and $branchCount -gt $WarnBranchCount) {
-            & $warn "HIGH BRANCH COUNT ($branchCount)"
+                Measure-Object -Line).Lines
+            if ($branchCount -gt $WarnBranchCount) {
+                & $warn "HIGH BRANCH COUNT ($branchCount)"
+            }
         }
 
         # --- LFS -----------------------------------------------------------
-        $gitAttributes = git --git-dir="$Repo.git" show 'HEAD:.gitattributes' 2>$null
-        if ($LASTEXITCODE -eq 0 -and $gitAttributes -match 'filter=lfs') {
+        $r = & $git --git-dir "$Repo.git" show HEAD:.gitattributes
+        if ($r.ExitCode -eq 0 -and ($r.Output -join "`n") -match 'filter=lfs') {
 
-            # WARN: LFS volume
+            # WARN: LFS volume.
             # git lfs ls-files -s outputs human-readable sizes, e.g.:
             #   abc123def * path/to/file (1.5 GB)
-            # The last two tokens inside the parens are <number> <unit>, so we
-            # parse both and convert to bytes for an accurate sum.
-            # NOTE: the original bash script used awk '{sum += $NF}' which always
-            # produced 0 because $NF captures the unit suffix ("GB)", "MB)", etc.),
-            # not a number — meaning the LARGE LFS VOLUME warning never fired.
-            $lfsSizeLines = git --git-dir="$Repo.git" lfs ls-files -s 2>$null
-            $lfsSize = if ($LASTEXITCODE -eq 0 -and $lfsSizeLines) {
+            # The last two tokens inside the parens are <number> <unit>, so
+            # we parse both and convert to bytes for an accurate sum.
+            # NOTE: the original bash script used awk '{sum += $NF}' which
+            # always produced 0 because $NF captures the unit suffix
+            # ("GB)", "MB)", etc.) — meaning the warning never fired.
+            $r = & $git --git-dir "$Repo.git" lfs ls-files -s
+            $lfsSize = if ($r.ExitCode -eq 0 -and $r.Output) {
                 $multipliers = @{ B = 1L; KB = 1KB; MB = 1MB; GB = 1GB; TB = 1TB }
-                ($lfsSizeLines | ForEach-Object {
+                ($r.Output | ForEach-Object {
                     if ($_ -match '\((\d+(?:\.\d+)?)\s+(B|KB|MB|GB|TB)\)') {
                         [long]([double]$Matches[1] * $multipliers[$Matches[2]])
                     } else { 0L }
@@ -201,10 +351,8 @@ $InvokeRepoValidation = {
             # --pointers checks pointer hashes are well-formed but does NOT
             # verify that LFS objects exist on GitHub or that historical
             # objects on all refs are present.
-            git --git-dir="$Repo.git" lfs fsck --pointers
-            if ($LASTEXITCODE -ne 0) {
-                & $fail 'LFS POINTER INTEGRITY FAILURE'
-            }
+            $r = & $git --git-dir "$Repo.git" lfs fsck --pointers
+            if ($r.ExitCode -ne 0) { & $fail 'LFS POINTER INTEGRITY FAILURE' }
 
             # Verify LFS objects exist on GitHub across all historical refs.
             # lfs fsck (no --pointers) forces pointer->object resolution
@@ -216,18 +364,15 @@ $InvokeRepoValidation = {
                 Name     = [System.IO.Path]::GetRandomFileName()
                 Force    = $true
             }
-
             try {
-                git clone --no-checkout "git@github.com:org/$Repo.git" $lfsTmp.FullName
-                if ($LASTEXITCODE -eq 0) {
-                    git -C $lfsTmp.FullName lfs fetch --all
-                    if ($LASTEXITCODE -eq 0) {
-                        git -C $lfsTmp.FullName lfs fsck
+                $r = & $git clone --no-checkout $ghUrl $lfsTmp.FullName
+                if ($r.ExitCode -eq 0) {
+                    $r = & $git -C $lfsTmp.FullName lfs fetch --all
+                    if ($r.ExitCode -eq 0) {
+                        $r = & $git -C $lfsTmp.FullName lfs fsck
                     }
                 }
-                if ($LASTEXITCODE -ne 0) {
-                    & $fail 'LFS OBJECT MISSING ON GITHUB'
-                }
+                if ($r.ExitCode -ne 0) { & $fail 'LFS OBJECT MISSING ON GITHUB' }
             } finally {
                 Remove-Item -Recurse -Force $lfsTmp.FullName -ErrorAction SilentlyContinue
             }
@@ -267,19 +412,21 @@ $InvokeRepoValidation = {
 
 Write-Verbose "Starting validation (parallelism=$Parallelism) ..."
 
-$repos = Get-Content $ReposFile | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-
 # ForEach-Object -Parallel spawns up to ThrottleLimit runspaces concurrently.
 # $using: is required to pass outer-scope values into each runspace.
 # The scriptblock body is passed by reference to avoid duplicating it inline.
 $results = $repos | ForEach-Object -Parallel {
     $fn     = $using:InvokeRepoValidation
     $params = @{
-        Repo             = $_
-        CsvOut           = $using:CsvOut
-        WarnRepoSizeKiB  = $using:WarnRepoSizeKiB
-        WarnBranchCount  = $using:WarnBranchCount
-        WarnLfsSizeBytes = $using:WarnLfsSizeBytes
+        Repo              = $_
+        CsvOut            = $using:CsvOut
+        GitHubOrg         = $using:GitHubOrg
+        GitHubHost        = $using:GitHubHost
+        GitHubRemoteName  = $using:GitHubRemoteName
+        BitbucketBase     = $using:BitbucketBase
+        WarnRepoSizeKiB   = $using:WarnRepoSizeKiB
+        WarnBranchCount   = $using:WarnBranchCount
+        WarnLfsSizeBytes  = $using:WarnLfsSizeBytes
     }
     & $fn @params
 } -ThrottleLimit $Parallelism
