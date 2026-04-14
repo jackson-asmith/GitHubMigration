@@ -7,8 +7,12 @@
 
 [CmdletBinding()]
 param(
-    # Output CSV path. Env var CSV_OUT is honoured for CI compatibility.
-    [string]$CsvOut = ($env:CSV_OUT ?? 'migration_validation.csv'),
+    # Output CSV path. Defaults to a timestamped filename in the current
+    # directory so each run produces a self-contained file with no risk of
+    # duplicate or stale rows from a previous run.
+    # Override via -CsvOut or $env:CSV_OUT for CI pipelines that need a
+    # predictable artifact path; an explicit path is always overwritten.
+    [string]$CsvOut = ($env:CSV_OUT ?? ("migration_validation_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
 
     # Concurrency cap. LFS repos each perform a full clone + lfs fetch --all
     # against GitHub. At Parallelism=4, assume up to 4 simultaneous clones.
@@ -169,15 +173,16 @@ if (-not (Test-Preflight @preflightParams)) {
     exit 1
 }
 
-# Initialise CSV header. Kept outside $InvokeRepoValidation so parallel
-# workers cannot race on header creation. A prototype object drives the
-# header so the column names stay in sync with the row-writing code below.
-if (-not (Test-Path $CsvOut)) {
-    [PSCustomObject]@{ repo = ''; status = ''; errors = 0; warnings = 0; notes = '' } |
+# Initialise CSV header. Set-Content overwrites any existing file, which is
+# intentional: a timestamped default path never collides with a previous run,
+# and an explicit -CsvOut path is always treated as a fresh destination.
+# Kept outside $InvokeRepoValidation so parallel workers cannot race on
+# header creation. A prototype object drives the header so column names
+# stay in sync with the row-writing code automatically.
+[PSCustomObject]@{ repo = ''; status = ''; errors = 0; warnings = 0; notes = '' } |
     ConvertTo-Csv -UseQuotes AsNeeded |
     Select-Object -First 1 |
     Set-Content $CsvOut -Encoding UTF8
-}
 
 # ==========================================================================
 # $InvokeRepoValidation
@@ -659,7 +664,7 @@ ForEach-Object {
     Remove-Item $_.FullName
 }
 
-Write-Verbose "Done. Results written to $CsvOut"
+Write-Information "Done. Results written to $CsvOut"
 
 # Surface exit code so callers and CI pipelines see failures.
 # Use the CSV to count and triage individual failures.
