@@ -441,11 +441,11 @@ $InvokeRepoValidation = {
         #     git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname)' |
         #     awk '$1=="blob" && $2<200 {print $3}' |
         #     git --git-dir=repo.git cat-file --batch |
-        #     grep 'version https://git-lfs.github.com/objects/'
+        #     grep 'version https://git-lfs.github.com/spec/v1'
         $hasLfsPointers = $false
         if (-not $hasLfsObjects -and -not $hasLfsConfig -and $allBranchTagRefs.Count -gt 0) {
             $grepArgs = @('--git-dir', "$Repo.git", 'grep', '-q', '--fixed-strings',
-                          'version https://git-lfs.github.com/objects/') + $allBranchTagRefs
+                          'version https://git-lfs.github.com/spec/v1') + $allBranchTagRefs
             $rg = & $git @grepArgs
             $hasLfsPointers = $rg.ExitCode -eq 0
         }
