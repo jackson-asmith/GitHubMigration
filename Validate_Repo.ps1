@@ -45,6 +45,7 @@ function Test-Preflight {
         [string]$GitHubOrg,
         [string]$GitHubHost,
         [string]$GitHubRemoteName,
+        [string]$BitbucketBase,
         [switch]$SkipSshTest
     )
 
@@ -65,6 +66,9 @@ function Test-Preflight {
     }
 
     # --- Repos list -----------------------------------------------------------
+    # Slugs may be bare names (my-repo) or single-depth paths (team/my-repo).
+    # A slug containing / implies a subdirectory layout for local mirrors
+    # (e.g. team/my-repo.git). Ensure your mirror root matches this structure.
     if ($Repos.Count -eq 0) {
         Write-Error 'Repos file is empty — nothing to validate'
         $ok = $false
@@ -85,24 +89,39 @@ function Test-Preflight {
     }
 
     # --- GitHub auth ----------------------------------------------------------
-    gh auth status 2>&1 | Out-Null
+    # --hostname targets the configured host explicitly; without it gh defaults
+    # to github.com regardless of $GitHubHost.
+    gh auth status --hostname $GitHubHost 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "gh is not authenticated — run 'gh auth login' first"
+        Write-Error "gh is not authenticated for $GitHubHost — run 'gh auth login --hostname $GitHubHost'"
         $ok = $false
     } else {
         # Cheap API call confirms the token is valid and the host is reachable.
-        gh api '/user' 2>&1 | Out-Null
+        gh api --hostname $GitHubHost '/user' 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "gh API call failed — check token scope and connectivity to $GitHubHost"
+            Write-Error "gh API call failed for $GitHubHost — check token scope and network connectivity"
             $ok = $false
         }
     }
 
-    # --- Optional SSH smoke test ----------------------------------------------
+    # --- Bitbucket connectivity -----------------------------------------------
+    # Smoke test against the first repo to catch SSH key or host reachability
+    # issues before spawning parallel workers.
+    if ($Repos.Count -gt 0) {
+        $bbTestUrl = "$BitbucketBase/$($Repos[0])"
+        Write-Verbose "Bitbucket connectivity test: $bbTestUrl"
+        git ls-remote $bbTestUrl HEAD 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Cannot reach Bitbucket at $bbTestUrl — check SSH key and access"
+            $ok = $false
+        }
+    }
+
+    # --- Optional GitHub SSH smoke test ---------------------------------------
     # Runs against the first repo; if SSH works for one it works for all.
     if (-not $SkipSshTest -and $Repos.Count -gt 0) {
         $testUrl = "git@${GitHubHost}:$GitHubOrg/$($Repos[0]).git"
-        Write-Verbose "SSH smoke test: $testUrl"
+        Write-Verbose "GitHub SSH smoke test: $testUrl"
         git ls-remote $testUrl HEAD 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Error "SSH smoke test failed for $testUrl — check SSH key and repo access"
@@ -125,6 +144,7 @@ $preflightParams = @{
     GitHubOrg        = $GitHubOrg
     GitHubHost       = $GitHubHost
     GitHubRemoteName = $GitHubRemoteName
+    BitbucketBase    = $BitbucketBase
     SkipSshTest      = $SkipSshTest
 }
 if (-not (Test-Preflight @preflightParams)) {
@@ -184,28 +204,44 @@ $InvokeRepoValidation = {
         $state.Warnings++
     }.GetNewClosure()
 
-    # Thin wrappers that capture stdout, stderr, and exit code together so
-    # FAIL messages can include the actual command error text. $args is
-    # splatted directly to the native command — no param() block needed.
+    # Thin wrappers that reliably capture stdout, stderr, and exit code.
+    # 2>&1 in PowerShell produces plain strings for native command stderr,
+    # not [ErrorRecord] objects — so we redirect stderr to a temp file
+    # to separate the streams correctly across all PS7 versions.
+    # $args is splatted directly to the native command — no param() needed.
     $git = {
-        $raw = git @args 2>&1
+        $errTmp = [IO.Path]::GetTempFileName()
+        try {
+            $stdout = git @args 2>$errTmp
+            $exit   = $LASTEXITCODE
+            $stderr = (Get-Content $errTmp -Raw -ErrorAction SilentlyContinue)?.Trim()
+        } finally {
+            Remove-Item $errTmp -ErrorAction SilentlyContinue
+        }
         [PSCustomObject]@{
-            Output   = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
-            Stderr   = ($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
-                        ForEach-Object { $_.Exception.Message }) -join ' '
-            ExitCode = $LASTEXITCODE
+            Output   = @($stdout | Where-Object { $_ -ne $null })
+            Stderr   = $stderr ?? ''
+            ExitCode = $exit
         }
     }
 
+    # $gh injects --hostname automatically via GetNewClosure() so every call
+    # targets the configured host rather than gh's default of github.com.
     $gh = {
-        $raw = gh @args 2>&1
-        [PSCustomObject]@{
-            Output   = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
-            Stderr   = ($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
-                        ForEach-Object { $_.Exception.Message }) -join ' '
-            ExitCode = $LASTEXITCODE
+        $errTmp = [IO.Path]::GetTempFileName()
+        try {
+            $stdout = gh --hostname $GitHubHost @args 2>$errTmp
+            $exit   = $LASTEXITCODE
+            $stderr = (Get-Content $errTmp -Raw -ErrorAction SilentlyContinue)?.Trim()
+        } finally {
+            Remove-Item $errTmp -ErrorAction SilentlyContinue
         }
-    }
+        [PSCustomObject]@{
+            Output   = @($stdout | Where-Object { $_ -ne $null })
+            Stderr   = $stderr ?? ''
+            ExitCode = $exit
+        }
+    }.GetNewClosure()
 
     # Convenience URL locals — avoids repeating construction throughout.
     $bbUrl = "$BitbucketBase/$Repo"
@@ -229,13 +265,13 @@ $InvokeRepoValidation = {
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $bbRefs = @()
-        } else { $bbRefs = $r.Output | Sort-Object }
+        } else { $bbRefs = $r.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object }
 
         $r = & $git ls-remote $ghUrl
         if ($r.ExitCode -ne 0) {
             & $fail "LS-REMOTE FAILED: github$(if ($r.Stderr) { ': ' + $r.Stderr })"
             $ghRefs = @()
-        } else { $ghRefs = $r.Output | Sort-Object }
+        } else { $ghRefs = $r.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object }
 
         if ($bbRefs -and $ghRefs -and (Compare-Object $bbRefs $ghRefs)) {
             & $fail 'REF MISMATCH'
