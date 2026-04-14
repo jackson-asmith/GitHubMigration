@@ -591,6 +591,13 @@ $InvokeRepoValidation = {
     # Select-Object -Skip 1 drops the header row — the header was written
     # once to CsvOut before workers were spawned.
     #
+    # Notes are serialised as a compact JSON array rather than a delimited
+    # string. A delimiter like ';' or '|' collides with content in note
+    # messages (e.g. stderr captured in FETCH FAILED includes arbitrary text).
+    # JSON is unambiguous for any content and round-trips cleanly.
+    # @($state.Notes) coerces the List[string] to a plain array so
+    # ConvertTo-Json always emits '[]' for an empty list rather than 'null'.
+    #
     # Forward slashes in the repo slug are replaced so the temp file name is
     # filesystem-safe; this does not affect the repo field written to the CSV.
     $safeRepo = $Repo -replace '[/\\]', '_'
@@ -599,7 +606,7 @@ $InvokeRepoValidation = {
         status   = $status
         errors   = $state.Errors
         warnings = $state.Warnings
-        notes    = $state.Notes -join ';'
+        notes    = ConvertTo-Json -InputObject @($state.Notes) -Compress
     } | ConvertTo-Csv -UseQuotes AsNeeded |
     Select-Object -Skip 1 |
     Set-Content "${CsvOut}.${safeRepo}.tmp" -Encoding UTF8
