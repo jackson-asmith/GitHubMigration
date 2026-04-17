@@ -180,9 +180,9 @@ if (-not (Test-Preflight @preflightParams)) {
 # header creation. A prototype object drives the header so column names
 # stay in sync with the row-writing code automatically.
 [PSCustomObject]@{ repo = ''; status = ''; errors = 0; warnings = 0; notes = '' } |
-    ConvertTo-Csv -UseQuotes AsNeeded |
-    Select-Object -First 1 |
-    Set-Content $CsvOut -Encoding UTF8
+ConvertTo-Csv -UseQuotes AsNeeded |
+Select-Object -First 1 |
+Set-Content $CsvOut -Encoding UTF8
 
 # ==========================================================================
 # $InvokeRepoValidation
@@ -276,6 +276,25 @@ $InvokeRepoValidation = {
     $git = { & $invokeNative 'git' $args }.GetNewClosure()
     $gh = { & $invokeNative 'gh' (@('--hostname', $GitHubHost) + $args) }.GetNewClosure()
 
+    # Wraps ls-remote: returns sorted ref lines on success, calls $fail and
+    # returns @() on failure. Captures $git and $fail via GetNewClosure.
+    $lsRemote = {
+        param([string]$Url, [string]$Label)
+        $r = & $git ls-remote $Url
+        if ($r.ExitCode -ne 0) {
+            & $fail "LS-REMOTE FAILED: $Label$($r.Stderr ? ': ' + $r.Stderr : '')"
+            return @()
+        }
+        $r.Output | Sort-Object
+    }.GetNewClosure()
+
+    # Extracts the HEAD SHA from a string array of ls-remote output lines.
+    $getHeadSha = {
+        param([string[]]$Refs)
+        $Refs | Where-Object { $_ -match '\sHEAD$' -and $_ -notmatch '^ref:' } |
+        ForEach-Object { ($_ -split '\s+')[0] } | Select-Object -First 1
+    }
+
     # Convenience URL locals — avoids repeating construction throughout.
     $bbUrl = "$BitbucketBase/$Repo"
     $ghUrl = "git@${GitHubHost}:$GitHubOrg/$Repo.git"
@@ -289,24 +308,13 @@ $InvokeRepoValidation = {
         # Fetch and prune before validating so stale, deleted, and renamed
         # refs are reflected in the local mirror prior to any diff.
         $r = & $git --git-dir "$Repo.git" fetch --prune $GitHubRemoteName
-        if ($r.ExitCode -ne 0) { & $fail "FETCH FAILED$(if ($r.Stderr) { ': ' + $r.Stderr })"; break }
+        if ($r.ExitCode -ne 0) { & $fail "FETCH FAILED$($r.Stderr ? ': ' + $r.Stderr : '')"; break }
 
         # --- Ref integrity -------------------------------------------------
         # Diff every ref/SHA pair between Bitbucket and GitHub. A clean diff
         # guarantees identical commit graphs.
-        $r = & $git ls-remote $bbUrl
-        if ($r.ExitCode -ne 0) {
-            & $fail "LS-REMOTE FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
-            $bbRefs = @()
-        }
-        else { $bbRefs = $r.Output | Sort-Object }
-
-        $r = & $git ls-remote $ghUrl
-        if ($r.ExitCode -ne 0) {
-            & $fail "LS-REMOTE FAILED: github$(if ($r.Stderr) { ': ' + $r.Stderr })"
-            $ghRefs = @()
-        }
-        else { $ghRefs = $r.Output | Sort-Object }
+        $bbRefs = & $lsRemote $bbUrl 'bitbucket'
+        $ghRefs = & $lsRemote $ghUrl 'github'
 
         if ($bbRefs -and $ghRefs -and (Compare-Object $bbRefs $ghRefs)) {
             & $fail 'REF MISMATCH'
@@ -331,7 +339,7 @@ $InvokeRepoValidation = {
         # a separate ls-remote for bbHead.
         $r = & $git ls-remote --symref $bbUrl HEAD
         if ($r.ExitCode -ne 0) {
-            & $fail "LS-REMOTE --SYMREF FAILED: bitbucket$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            & $fail "LS-REMOTE --SYMREF FAILED: bitbucket$($r.Stderr ? ': ' + $r.Stderr : '')"
             $bbDefault = $null
             $bbHead = $null
         }
@@ -341,15 +349,12 @@ $InvokeRepoValidation = {
             ForEach-Object { ($_ -split '\s+')[1] } |
             Select-Object -First 1
             # Reuse the --symref output for HEAD SHA — no separate ls-remote needed.
-            $bbHead = $r.Output |
-            Where-Object { $_ -match '\sHEAD$' -and $_ -notmatch '^ref:' } |
-            ForEach-Object { ($_ -split '\s+')[0] } |
-            Select-Object -First 1
+            $bbHead = & $getHeadSha $r.Output
         }
 
         $r = & $gh api "/repos/$GitHubOrg/$Repo" --jq '.default_branch'
         if ($r.ExitCode -ne 0) {
-            & $fail "GH API FAILED: default_branch$(if ($r.Stderr) { ': ' + $r.Stderr })"
+            & $fail "GH API FAILED: default_branch$($r.Stderr ? ': ' + $r.Stderr : '')"
             $ghDefault = $null
         }
         else { $ghDefault = $r.Output | Select-Object -First 1 }
@@ -361,10 +366,7 @@ $InvokeRepoValidation = {
 
         # GitHub HEAD SHA extracted from the already-fetched $ghRefs —
         # no additional ls-remote call needed.
-        $ghHead = $ghRefs |
-        Where-Object { $_ -match '\sHEAD$' } |
-        ForEach-Object { ($_ -split '\s+')[0] } |
-        Select-Object -First 1
+        $ghHead = & $getHeadSha $ghRefs
 
         if ($bbHead -and $ghHead -and $bbHead -ne $ghHead) {
             & $fail "HEAD SHA MISMATCH: bb=$bbHead gh=$ghHead"
@@ -386,9 +388,7 @@ $InvokeRepoValidation = {
         # --- WARN: branch count --------------------------------------------
         $r = & $git --git-dir "$Repo.git" branch -r
         if ($r.ExitCode -eq 0) {
-            $branchCount = ($r.Output |
-                Where-Object { $_ -notmatch '->' } |
-                Measure-Object -Line).Lines
+            $branchCount = @($r.Output | Where-Object { $_ -notmatch '->' }).Count
             if ($branchCount -gt $WarnBranchCount) {
                 & $warn "HIGH BRANCH COUNT ($branchCount)"
             }
@@ -567,7 +567,7 @@ $InvokeRepoValidation = {
             # Standard LFS validation cannot proceed reliably; manual audit
             # required. See the Tier C comment above for the full history sweep.
             & $warn ('UNTRACKED LFS POINTER SIGNATURES FOUND IN BLOB CONTENT — ' +
-                     'git-lfs does not recognise these objects; manual LFS audit required')
+                'git-lfs does not recognise these objects; manual LFS audit required')
         }
 
     } while ($false)

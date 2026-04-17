@@ -33,10 +33,10 @@ BeforeAll {
     }
 
     $fnDef = $ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Test-Preflight'
-    }, $false) | Select-Object -First 1
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Test-Preflight'
+        }, $false) | Select-Object -First 1
 
     if (-not $fnDef) { throw 'Test-Preflight function not found in script' }
 
@@ -88,16 +88,16 @@ Describe 'Test-Preflight' {
 
         # Default: all git and gh calls succeed.
         $script:GitImpl = { $global:LASTEXITCODE = 0 }
-        $script:GhImpl  = { $global:LASTEXITCODE = 0 }
+        $script:GhImpl = { $global:LASTEXITCODE = 0 }
 
         # Default: Get-Command finds both tools; Test-Path finds the mirror.
         Mock Get-Command { [PSCustomObject]@{ Name = $Name } }
-        Mock Test-Path   { $true }
+        Mock Test-Path { $true }
     }
 
     # -----------------------------------------------------------------------
     Context 'Required tools' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when git is not on PATH' {
             Mock Get-Command { $null } -ParameterFilter { $Name -eq 'git' }
@@ -138,7 +138,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'Repos list' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when the repos list is empty' {
             $p = $script:DefaultParams.Clone(); $p.Repos = @()
@@ -148,7 +148,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'Local mirror checks' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when the local mirror directory is missing' {
             Mock Test-Path { $false }
@@ -198,7 +198,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'GitHub authentication' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when gh auth status fails' {
             $script:GhImpl = {
@@ -212,9 +212,9 @@ Describe 'Test-Preflight' {
         It 'returns $false when the gh API call fails after successful auth' {
             $script:GhImpl = {
                 param([string[]]$A)
-                if ($A -contains 'status')   { $global:LASTEXITCODE = 0 }
+                if ($A -contains 'status') { $global:LASTEXITCODE = 0 }
                 elseif ($A -contains '/user') { $global:LASTEXITCODE = 1 }
-                else                          { $global:LASTEXITCODE = 0 }
+                else { $global:LASTEXITCODE = 0 }
             }
 
             Test-Preflight @script:DefaultParams -SkipSshTest | Should -BeFalse
@@ -224,9 +224,9 @@ Describe 'Test-Preflight' {
             $apiWasCalled = $false
             $script:GhImpl = {
                 param([string[]]$A)
-                if ($A -contains 'status')   { $global:LASTEXITCODE = 1 }
+                if ($A -contains 'status') { $global:LASTEXITCODE = 1 }
                 elseif ($A -contains '/user') { $apiWasCalled = $true; $global:LASTEXITCODE = 0 }
-                else                          { $global:LASTEXITCODE = 0 }
+                else { $global:LASTEXITCODE = 0 }
             }
 
             Test-Preflight @script:DefaultParams -SkipSshTest
@@ -257,7 +257,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'Bitbucket connectivity' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when the Bitbucket ls-remote fails' {
             $script:GitImpl = {
@@ -303,7 +303,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'GitHub SSH smoke test' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $false when the SSH ls-remote fails' {
             $script:GitImpl = {
@@ -321,7 +321,7 @@ Describe 'Test-Preflight' {
                 param([string[]]$A)
                 $url = $A | Where-Object { $_ -like 'git@*' } | Select-Object -First 1
                 if ($url) { $sshCalled = $true; $global:LASTEXITCODE = 1 }
-                else      { $global:LASTEXITCODE = 0 }
+                else { $global:LASTEXITCODE = 0 }
             }
 
             Test-Preflight @script:DefaultParams -SkipSshTest
@@ -367,7 +367,7 @@ Describe 'Test-Preflight' {
 
     # -----------------------------------------------------------------------
     Context 'All checks pass' {
-    # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         It 'returns $true when all tools, mirrors, auth, and connectivity succeed' {
             Test-Preflight @script:DefaultParams | Should -BeTrue
@@ -557,16 +557,16 @@ Describe 'Default branch extraction from ls-remote --symref output' {
         # $InvokeRepoValidation to parse the --symref HEAD output.
         function ExtractSymref([string[]]$Lines) {
             $Lines |
-                Where-Object { $_ -match '^ref:' } |
-                ForEach-Object { ($_ -split '\s+')[1] } |
-                Select-Object -First 1
+            Where-Object { $_ -match '^ref:' } |
+            ForEach-Object { ($_ -split '\s+')[1] } |
+            Select-Object -First 1
         }
 
         function ExtractHeadSha([string[]]$Lines) {
             $Lines |
-                Where-Object { $_ -match '\sHEAD$' -and $_ -notmatch '^ref:' } |
-                ForEach-Object { ($_ -split '\s+')[0] } |
-                Select-Object -First 1
+            Where-Object { $_ -match '\sHEAD$' -and $_ -notmatch '^ref:' } |
+            ForEach-Object { ($_ -split '\s+')[0] } |
+            Select-Object -First 1
         }
     }
 
