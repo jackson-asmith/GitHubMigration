@@ -1,0 +1,49 @@
+# ==========================================================================
+# Migration artefacts
+# ==========================================================================
+
+# CSV reports produced by both scripts
+*.csv
+
+# Per-repo temp files written by parallel workers before the merge step
+*.tmp
+
+# Local bare-mirror directories cloned from Bitbucket.
+# These can be very large and are always recreatable from source.
+*.git/
+
+# Repo list — may contain internal project or team names.
+# Commit a repos.txt.example instead if you need to document the format.
+repos.txt
+
+# ==========================================================================
+# OS
+# ==========================================================================
+
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ==========================================================================
+# Editors
+# ==========================================================================
+
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# ==========================================================================
+# PowerShell / Pester
+# ==========================================================================
+
+# Pester test result files (NUnit XML, JaCoCo, etc.)
+testResults.xml
+coverage.xml
